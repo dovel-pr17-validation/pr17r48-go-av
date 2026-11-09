@@ -1,0 +1,139 @@
+version: 2
+
+git:
+  ignore_tags:
+    - "*-nightly"
+
+before:
+  hooks:
+    - "rm -rf man"
+    - 'sh -c "cd docs && go run convert-manpages.go --output-dir ../man --version v{{ .Version }}"'
+
+builds:
+  - dir: "./cmd/av"
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - "-X 'github.com/aviator-co/av/internal/config.Version=v{{ .Version }}'"
+
+# Create a GitHub release on the av repo
+release: {}
+
+archives:
+  - name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "darwin" }}macos
+      {{- else }}{{ .Arch }}{{ end }}
+    files:
+      - "LICENSE"
+      - "README.md"
+      - "man"
+
+nfpms:
+  - id: packages
+    vendor: "Aviator"
+    homepage: "https://aviator.co"
+    maintainer: "Masaya Suzuki <masaya@aviator.co>"
+    description: "CLI tool to create, update, review and merge stacked PRs on GitHub."
+    license: "MIT"
+    section: "utils"
+    formats: ["deb", "rpm"]
+    dependencies: ["git"]
+    contents:
+      - src: "man/man1/*"
+        dst: "/usr/share/man/man1"
+      - src: "man/man7/*"
+        dst: "/usr/share/man/man7"
+    deb:
+      lintian_overrides:
+        - "statically-linked-binary"
+        - "changelog-file-missing-in-native-package"
+
+# Push to the homebrew tap
+brews:
+  - skip_upload: '{{ if eq (index .Env "RELEASE_ENV") "nightly" }}true{{ else }}false{{ end }}'
+    repository:
+      owner: "aviator-co"
+      name: "homebrew-tap"
+      git:
+        url: "git@github.com:aviator-co/homebrew-tap.git"
+        private_key: "{{ .Env.AVIATOR_CO_HOMEBREW_REPO_SSH_KEY }}"
+    commit_author:
+      name: "aviator-bot"
+      email: "105820887+aviator-bot@users.noreply.github.com"
+    homepage: "https://aviator.co"
+    license: "MIT"
+    install: |
+      bin.install "av"
+      man.install Dir["man/*"]
+      generate_completions_from_executable(bin/"av", "completion", shells: [:bash, :zsh, :fish])
+
+  - name: av-nightly
+    skip_upload: '{{ if eq (index .Env "RELEASE_ENV") "nightly" }}false{{ else }}true{{ end }}'
+    repository:
+      owner: "aviator-co"
+      name: "homebrew-tap"
+      git:
+        url: "git@github.com:aviator-co/homebrew-tap.git"
+        private_key: "{{ .Env.AVIATOR_CO_HOMEBREW_REPO_SSH_KEY }}"
+    commit_author:
+      name: "aviator-bot"
+      email: "105820887+aviator-bot@users.noreply.github.com"
+    homepage: "https://aviator.co"
+    license: "MIT"
+    install: |
+      bin.install "av"
+      man.install Dir["man/*"]
+      generate_completions_from_executable(bin/"av", "completion", shells: [:bash, :zsh, :fish])
+
+aurs:
+  - name: "av-cli-bin"
+    homepage: "https://aviator.co"
+    description: "CLI tool to create, update, review and merge stacked PRs on GitHub."
+    maintainers:
+      - "Masaya Suzuki <masaya@aviator.co>"
+    license: "MIT"
+    depends: ["git"]
+    provides: ["av-cli"]
+    conflicts: ["av-cli"]
+    optdepends: ["github-cli: for GitHub authentication"]
+    private_key: "{{ .Env.AVIATOR_CO_HOMEBREW_REPO_SSH_KEY }}"
+    git_url: "ssh://aur@aur.archlinux.org/av-cli-bin.git"
+    package: |-
+      install -Dm755 "./av" "${pkgdir}/usr/bin/av"
+      install -Dm644 "./LICENSE" "${pkgdir}/usr/share/licenses/av/LICENSE"
+      for manpage in $(ls ./man/man1); do
+        install -Dm644 "./man/man1/${manpage}" "${pkgdir}/usr/share/man/man1/${manpage}"
+      done
+
+publishers:
+  - name: fury.io
+    disable: '{{ if eq (index .Env "RELEASE_ENV") "nightly" }}true{{ else }}false{{ end }}'
+    ids:
+      - packages
+    dir: "{{ dir .ArtifactPath }}"
+    cmd: curl -F package=@{{ .ArtifactName }} https://{{ .Env.FURY_TOKEN }}@push.fury.io/aviator/
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev-{{ .ShortCommit }}"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

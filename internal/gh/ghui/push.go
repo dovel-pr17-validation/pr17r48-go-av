@@ -1,0 +1,614 @@
+package ghui
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"emperror.dev/errors"
+	"github.com/aviator-co/av/internal/actions"
+	avconfig "github.com/aviator-co/av/internal/config"
+	"github.com/aviator-co/av/internal/gh"
+	"github.com/aviator-co/av/internal/git"
+	"github.com/aviator-co/av/internal/meta"
+	"github.com/aviator-co/av/internal/utils/colors"
+	"github.com/aviator-co/av/internal/utils/ghutils"
+	"github.com/aviator-co/av/internal/utils/stackutils"
+	"github.com/aviator-co/av/internal/utils/uiutils"
+	"github.com/dustin/go-humanize"
+	"github.com/erikgeiser/promptkit/selection"
+	"github.com/go-git/go-git/v6/config"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
+)
+
+const (
+	continuePush = "Yes. Push the branches to GitHub."
+	abortPush    = "No. Do not push the branches to GitHub."
+
+	reasonAlreadyUpToDate   = "Already up-to-date."
+	reasonNotPushedToRemote = "No remote branch yet."
+	reasonPRIsMerged        = "PR is already merged."
+	reasonPRIsClosed        = "PR is closed."
+	reasonParentNotPushed   = "Parent branch is not pushed to remote."
+	reasonNoPR              = "Some branches in a stack do not have a PR."
+
+	// gitPushChunkSize caps how many ref updates we send in a single
+	// `git push` invocation. GitHub rejects pushes with more than 20 ref
+	// updates ("max ref updates exceeded"), so we split the candidate set
+	// into chunks of this size and push each one separately. Each chunk is
+	// still atomic (--atomic), but the operation as a whole is not
+	// (#638).
+	gitPushChunkSize = 20
+)
+
+type pushCandidate struct {
+	branch       plumbing.ReferenceName
+	remoteCommit *object.Commit
+	localCommit  *object.Commit
+	remotePRMeta actions.PRMetadata
+	localPRMeta  actions.PRMetadata
+}
+
+type noPushBranch struct {
+	branch plumbing.ReferenceName
+	reason string
+}
+
+func NewGitHubPushModel(
+	repo *git.Repo,
+	db meta.DB,
+	client *gh.Client,
+	pushFlag string,
+	targetBranches []plumbing.ReferenceName,
+	onDone func() tea.Cmd,
+) *GitHubPushModel {
+	var makeDraftBeforePush bool
+	if avconfig.Av.PullRequest.RebaseWithDraft != nil {
+		makeDraftBeforePush = *avconfig.Av.PullRequest.RebaseWithDraft
+	} else {
+		makeDraftBeforePush = ghutils.HasCodeowners(repo)
+	}
+	return &GitHubPushModel{
+		repo:                repo,
+		db:                  db,
+		client:              client,
+		makeDraftBeforePush: makeDraftBeforePush,
+		pushFlag:            pushFlag,
+		targetBranches:      targetBranches,
+		spinner:             spinner.New(spinner.WithSpinner(spinner.Dot)),
+		help:                help.New(),
+		chooseNoPush:        pushFlag == "no",
+		pullRequestsCache:   map[string]*gh.PullRequest{},
+		onDone:              onDone,
+	}
+}
+
+type GitHubPushProgress struct {
+	candidateCalculationDone bool
+	gitPushDone              bool
+}
+
+type GitHubPushModel struct {
+	repo                *git.Repo
+	db                  meta.DB
+	client              *gh.Client
+	makeDraftBeforePush bool
+	pushFlag            string
+	targetBranches      []plumbing.ReferenceName
+	spinner             spinner.Model
+	help                help.Model
+	onDone              func() tea.Cmd
+
+	chooseNoPush   bool
+	pushCandidates []pushCandidate
+	noPushBranches []noPushBranch
+	pushPrompt     *selection.Model[string]
+	// key is  internal/gh/pullrequest.PullRequest.ID
+	pullRequestsCache map[string]*gh.PullRequest
+
+	calculatingCandidates bool
+	askingForConfirmation bool
+	runningGitPush        bool
+	done                  bool
+}
+
+func (vm *GitHubPushModel) Init() tea.Cmd {
+	vm.calculatingCandidates = true
+	return tea.Batch(vm.spinner.Tick, vm.calculateChangedBranches)
+}
+
+func (vm *GitHubPushModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case *GitHubPushProgress:
+		if msg.candidateCalculationDone {
+			vm.calculatingCandidates = false
+			if len(vm.pushCandidates) == 0 || vm.chooseNoPush {
+				vm.done = true
+				return vm, vm.onDone()
+			}
+			if vm.pushFlag == "yes" {
+				vm.runningGitPush = true
+				return vm, vm.runUpdate
+			}
+			vm.askingForConfirmation = true
+			vm.pushPrompt = uiutils.NewLegacyPromptModel("Are you OK with pushing these branches to remote?", []string{continuePush, abortPush})
+			return vm, vm.pushPrompt.Init()
+		}
+		if msg.gitPushDone {
+			vm.runningGitPush = false
+			vm.done = true
+			return vm, vm.onDone()
+		}
+	case tea.KeyPressMsg:
+		if vm.askingForConfirmation {
+			switch msg.String() {
+			case "enter":
+				c, err := vm.pushPrompt.Value()
+				if err != nil {
+					return vm, uiutils.ErrCmd(err)
+				}
+				vm.askingForConfirmation = false
+				vm.pushPrompt = nil
+				if c != continuePush {
+					vm.chooseNoPush = true
+					vm.done = true
+					return vm, vm.onDone()
+				}
+				vm.runningGitPush = true
+				return vm, vm.runUpdate
+			case "ctrl+c":
+				return vm, tea.Quit
+			default:
+				_, cmd := vm.pushPrompt.Update(msg)
+				return vm, cmd
+			}
+		}
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		vm.spinner, cmd = vm.spinner.Update(msg)
+		return vm, cmd
+	}
+	return vm, nil
+}
+
+func (vm *GitHubPushModel) View() tea.View {
+	if vm.calculatingCandidates {
+		return tea.NewView(colors.ProgressStyle.Render(vm.spinner.View() + "Finding the changed branches..."))
+	}
+
+	sb := strings.Builder{}
+	if len(vm.pushCandidates) == 0 {
+		sb.WriteString(colors.SuccessStyle.Render("✓ Nothing to push to GitHub"))
+	} else if vm.askingForConfirmation {
+		sb.WriteString("Confirming the push to GitHub")
+	} else if vm.runningGitPush {
+		sb.WriteString(colors.ProgressStyle.Render(vm.spinner.View() + "Pushing to GitHub..."))
+	} else if vm.done {
+		if vm.chooseNoPush {
+			sb.WriteString(colors.SuccessStyle.Render("✓ Not pushing to GitHub"))
+		} else {
+			sb.WriteString(colors.SuccessStyle.Render("✓ Pushed to GitHub"))
+		}
+	}
+
+	if len(vm.noPushBranches) > 0 || len(vm.pushCandidates) > 0 {
+		sb.WriteString("\n")
+	}
+
+	if len(vm.noPushBranches) > 0 {
+		sb.WriteString("\n")
+		sb.WriteString("  Following branches do not need a push.\n")
+		sb.WriteString("\n")
+		sb.WriteString(lipgloss.NewStyle().MarginLeft(4).Render(vm.viewNoPushBranches()))
+	}
+	if len(vm.pushCandidates) > 0 {
+		sb.WriteString("\n")
+		if vm.runningGitPush {
+			sb.WriteString("  Following branches are being pushed...\n")
+		} else if vm.done && !vm.chooseNoPush {
+			sb.WriteString("  Following branches are pushed.\n")
+		} else {
+			sb.WriteString("  Following branches need to be pushed.\n")
+		}
+		sb.WriteString("\n")
+		sb.WriteString(lipgloss.NewStyle().MarginLeft(4).Render(vm.viewPushCandidates()))
+	}
+
+	if vm.pushPrompt != nil {
+		sb.WriteString("\n")
+		sb.WriteString(vm.pushPrompt.View().Content)
+		sb.WriteString(vm.help.ShortHelpView(uiutils.PromptKeys))
+	}
+	return tea.NewView(sb.String())
+}
+
+func (vm *GitHubPushModel) viewPushCandidates() string {
+	sb := strings.Builder{}
+	for i, branch := range vm.pushCandidates {
+		if i > 0 {
+			sb.WriteString("\n")
+		}
+		sb.WriteString(branch.branch.Short() + "\n")
+		sb.WriteString(
+			"  Remote: " + branch.remoteCommit.Hash.String()[:7] + " " + getFirstLine(
+				branch.remoteCommit.Message,
+			) + " " + branch.remoteCommit.Committer.When.String() + " (" + humanize.Time(
+				branch.remoteCommit.Committer.When,
+			) + ")\n",
+		)
+		sb.WriteString("         Parent=" + branch.remotePRMeta.Parent + "\n")
+		sb.WriteString(
+			"  Local:  " + branch.localCommit.Hash.String()[:7] + " " + getFirstLine(
+				branch.localCommit.Message,
+			) + " " + branch.localCommit.Committer.When.String() + " (" + humanize.Time(
+				branch.localCommit.Committer.When,
+			) + ")\n",
+		)
+		sb.WriteString("         Parent=" + branch.localPRMeta.Parent + "\n")
+		avbr, _ := vm.db.ReadTx().Branch(branch.branch.Short())
+		if avbr.PullRequest != nil && avbr.PullRequest.Permalink != "" {
+			sb.WriteString("  PR:     " + avbr.PullRequest.Permalink + "\n")
+		}
+	}
+	return sb.String()
+}
+
+func (vm *GitHubPushModel) viewNoPushBranches() string {
+	sb := strings.Builder{}
+	for _, branch := range vm.noPushBranches {
+		sb.WriteString(branch.branch.Short() + ": " + branch.reason + "\n")
+	}
+	return sb.String()
+}
+
+func (vm *GitHubPushModel) runUpdate() (ret tea.Msg) {
+	ghPRs, err := vm.getPRs()
+	if err != nil {
+		return err
+	}
+	if vm.makeDraftBeforePush {
+		if err := vm.makePRsDraft(ghPRs); err != nil {
+			return err
+		}
+	}
+	defer func() {
+		if vm.makeDraftBeforePush {
+			if err := vm.undraftPRs(ghPRs); err != nil {
+				ret = err
+			}
+		}
+	}()
+	if err := vm.updatePRs(ghPRs); err != nil {
+		return err
+	}
+	if err := vm.runGitPush(); err != nil {
+		return err
+	}
+	return &GitHubPushProgress{gitPushDone: true}
+}
+
+func (vm *GitHubPushModel) runGitPush() error {
+	ctx := context.Background()
+	// Split into chunks so we don't exceed GitHub's per-push ref-update
+	// limit (#638). Each chunk is still atomic on its own; only the
+	// cross-chunk operation is non-atomic.
+	for start := 0; start < len(vm.pushCandidates); start += gitPushChunkSize {
+		end := start + gitPushChunkSize
+		if end > len(vm.pushCandidates) {
+			end = len(vm.pushCandidates)
+		}
+		chunk := vm.pushCandidates[start:end]
+		pushArgs := []string{"push", vm.repo.GetRemoteName(), "--atomic"}
+		for _, branch := range chunk {
+			// Do a compare-and-swap to be strict on what we show as a difference.
+			pushArgs = append(
+				pushArgs,
+				fmt.Sprintf(
+					"--force-with-lease=%s:%s",
+					branch.branch.String(),
+					branch.remoteCommit.Hash.String(),
+				),
+			)
+		}
+		for _, branch := range chunk {
+			// Push the exact commit hash to be strict on what we show as a difference.
+			pushArgs = append(
+				pushArgs,
+				fmt.Sprintf("%s:%s", branch.localCommit.Hash.String(), branch.branch.String()),
+			)
+		}
+		res, err := vm.repo.Run(ctx, &git.RunOpts{
+			Args: pushArgs,
+		})
+		if err != nil {
+			return errors.WrapIff(err, "failed to push branches to GitHub")
+		}
+		if res.ExitCode != 0 {
+			return errors.Errorf(
+				"failed to push branches to GitHub\n%s\n%s",
+				res.Stdout,
+				res.Stderr,
+			)
+		}
+	}
+
+	var errs []error
+	for _, branch := range vm.pushCandidates {
+		if err := vm.repo.BranchSetConfig(ctx, branch.branch.Short(), "av-pushed-remote", vm.repo.GetRemoteName()); err != nil {
+			errs = append(errs, err)
+		}
+		if err := vm.repo.BranchSetConfig(ctx, branch.branch.Short(), "av-pushed-ref", branch.branch.String()); err != nil {
+			errs = append(errs, err)
+		}
+		if err := vm.repo.BranchSetConfig(ctx, branch.branch.Short(), "av-pushed-commit", branch.localCommit.Hash.String()); err != nil {
+			errs = append(errs, err)
+		}
+		if err := vm.repo.BranchSetUpstream(ctx, branch.branch.Short(), vm.repo.GetRemoteName()); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Combine(errs...)
+}
+
+func (vm *GitHubPushModel) getPRs() (map[plumbing.ReferenceName]*gh.PullRequest, error) {
+	prs := map[plumbing.ReferenceName]*gh.PullRequest{}
+	for _, branch := range vm.pushCandidates {
+		avbr, _ := vm.db.ReadTx().Branch(branch.branch.Short())
+
+		if avbr.PullRequest == nil {
+			continue
+		}
+
+		if pr, ok := vm.pullRequestsCache[avbr.PullRequest.ID]; ok {
+			prs[branch.branch] = pr
+			continue
+		}
+
+		pr, err := vm.client.PullRequest(context.Background(), avbr.PullRequest.ID)
+		if err != nil {
+			return nil, err
+		}
+		prs[branch.branch] = pr
+		vm.pullRequestsCache[avbr.PullRequest.ID] = pr
+	}
+	return prs, nil
+}
+
+func (vm *GitHubPushModel) makePRsDraft(ghPRs map[plumbing.ReferenceName]*gh.PullRequest) error {
+	for _, pr := range ghPRs {
+		if pr.State == "OPEN" && !pr.IsDraft {
+			if _, err := vm.client.ConvertPullRequestToDraft(context.Background(), pr.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (vm *GitHubPushModel) updatePRs(ghPRs map[plumbing.ReferenceName]*gh.PullRequest) error {
+	for br, pr := range ghPRs {
+		avbr, _ := vm.db.ReadTx().Branch(br.Short())
+		prMeta := vm.createPRMetadata(avbr)
+
+		var stackToWrite *stackutils.StackTreeNode
+		if avconfig.Av.PullRequest.WriteStack {
+			var err error
+			if stackToWrite, err = stackutils.BuildStackTreeCurrentStack(vm.db.ReadTx(), br.Short(), false); err != nil {
+				return err
+			}
+		}
+		prBody := actions.AddPRMetadataAndStack(
+			pr.Body,
+			prMeta,
+			avbr.Name,
+			stackToWrite,
+			vm.db.ReadTx(),
+		)
+		if _, err := vm.client.UpdatePullRequestIfChanged(context.Background(), pr, gh.UpdatePullRequestFields{
+			Body:        gh.Ptr(prBody),
+			BaseRefName: gh.Ptr(avbr.Parent.Name),
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (vm *GitHubPushModel) undraftPRs(ghPRs map[plumbing.ReferenceName]*gh.PullRequest) error {
+	for _, pr := range ghPRs {
+		if pr.State == "OPEN" && !pr.IsDraft {
+			if _, err := vm.client.MarkPullRequestReadyForReview(context.Background(), pr.ID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (vm *GitHubPushModel) calculateChangedBranches() tea.Msg {
+	repo := vm.repo.GoGitRepo()
+	remote, err := repo.Remote(vm.repo.GetRemoteName())
+	if err != nil {
+		return errors.Errorf("failed to get remote %s: %v", vm.repo.GetRemoteName(), err)
+	}
+	remoteConfig := remote.Config()
+
+	var noPushBranches []noPushBranch
+	var pushCandidates []pushCandidate
+
+	for _, br := range vm.targetBranches {
+		avbr, _ := vm.db.ReadTx().Branch(br.Short())
+		if avbr.MergeCommit != "" ||
+			(avbr.PullRequest != nil && avbr.PullRequest.State == "MERGED") {
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonPRIsMerged,
+			})
+			continue
+		}
+		if avbr.PullRequest != nil && avbr.PullRequest.State == "CLOSED" {
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonPRIsClosed,
+			})
+			continue
+		}
+
+		rtb := mapToRemoteTrackingBranch(remoteConfig, br)
+		if rtb == nil {
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonNotPushedToRemote,
+			})
+			continue
+		}
+
+		remoteRef, err := repo.Reference(*rtb, true)
+		if err != nil {
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonNotPushedToRemote,
+			})
+			continue
+		}
+
+		localRef, err := repo.Reference(br, true)
+		if err != nil {
+			return err
+		}
+
+		localPRMeta := vm.createPRMetadata(avbr)
+		remotePRMeta := actions.PRMetadata{}
+		remotePR := vm.remotePR(avbr)
+		if remotePR != nil {
+			if m, err := actions.ReadPRMetadata(remotePR.Body); err == nil {
+				// Ignore the parsing error.
+				remotePRMeta = m
+			}
+		}
+
+		if localRef.Hash() == remoteRef.Hash() && localPRMeta == remotePRMeta {
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonAlreadyUpToDate,
+			})
+			continue
+		}
+
+		if !vm.allParentsHaveRemoteTrackingBranch(remoteConfig, br) {
+			// If a parent doesn't have a remote tracking branch, the PR cannot be made
+			// with that branch as the base. We cannot push this branch.
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonParentNotPushed,
+			})
+			continue
+		}
+		if !vm.allBranchesOnStackHavePRs(br) {
+			// If an ancestor branch doesn't have a PR, the PR cannot be made with the
+			// right metadata.
+			noPushBranches = append(noPushBranches, noPushBranch{
+				branch: br,
+				reason: reasonNoPR,
+			})
+			continue
+		}
+
+		remoteRefCommit, err := repo.CommitObject(remoteRef.Hash())
+		if err != nil {
+			return err
+		}
+		localRefCommit, err := repo.CommitObject(localRef.Hash())
+		if err != nil {
+			return err
+		}
+
+		pushCandidates = append(pushCandidates, pushCandidate{
+			branch:       br,
+			remoteCommit: remoteRefCommit,
+			localCommit:  localRefCommit,
+			remotePRMeta: remotePRMeta,
+			localPRMeta:  localPRMeta,
+		})
+	}
+	vm.noPushBranches = noPushBranches
+	vm.pushCandidates = pushCandidates
+	return &GitHubPushProgress{candidateCalculationDone: true}
+}
+
+func (vm *GitHubPushModel) allParentsHaveRemoteTrackingBranch(
+	remoteConfig *config.RemoteConfig,
+	br plumbing.ReferenceName,
+) bool {
+	avbr, _ := vm.db.ReadTx().Branch(br.Short())
+	parent := avbr.Parent
+	for !parent.Trunk {
+		avbr, _ := vm.db.ReadTx().Branch(parent.Name)
+		rtb := mapToRemoteTrackingBranch(remoteConfig, plumbing.NewBranchReferenceName(parent.Name))
+		if rtb == nil {
+			return false
+		}
+		parent = avbr.Parent
+	}
+	return true
+}
+
+func (vm *GitHubPushModel) allBranchesOnStackHavePRs(br plumbing.ReferenceName) bool {
+	avbr, _ := vm.db.ReadTx().Branch(br.Short())
+	for {
+		if avbr.PullRequest == nil {
+			return false
+		}
+		if avbr.Parent.Trunk {
+			return true
+		}
+		avbr, _ = vm.db.ReadTx().Branch(avbr.Parent.Name)
+	}
+}
+
+func (vm *GitHubPushModel) remotePR(avbr meta.Branch) *gh.PullRequest {
+	if avbr.PullRequest == nil {
+		return nil
+	}
+	if pr, ok := vm.pullRequestsCache[avbr.PullRequest.ID]; ok {
+		return pr
+	}
+	pr, err := vm.client.PullRequest(context.Background(), avbr.PullRequest.ID)
+	if err != nil {
+		return nil
+	}
+	vm.pullRequestsCache[avbr.PullRequest.ID] = pr
+	return pr
+}
+
+func (vm *GitHubPushModel) createPRMetadata(branch meta.Branch) actions.PRMetadata {
+	trunk, _ := meta.Trunk(vm.db.ReadTx(), branch.Name)
+
+	metadata := actions.PRMetadata{
+		Parent:     branch.Parent.Name,
+		ParentHead: branch.Parent.BranchingPointCommitHash,
+		Trunk:      trunk,
+	}
+
+	if !branch.Parent.Trunk {
+		parent, _ := vm.db.ReadTx().Branch(branch.Parent.Name)
+		if parent.PullRequest != nil {
+			metadata.ParentPull = parent.PullRequest.Number
+		}
+	}
+
+	return metadata
+}
+
+func getFirstLine(s string) string {
+	idx := strings.Index(s, "\n")
+	if idx == -1 {
+		return s
+	}
+	return s[:idx]
+}

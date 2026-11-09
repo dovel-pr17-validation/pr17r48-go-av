@@ -1,0 +1,213 @@
+package main
+
+import (
+	"context"
+
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"emperror.dev/errors"
+	"github.com/aviator-co/av/internal/actions"
+	"github.com/aviator-co/av/internal/git"
+	"github.com/aviator-co/av/internal/meta"
+	"github.com/aviator-co/av/internal/sequencer"
+	"github.com/aviator-co/av/internal/sequencer/planner"
+	"github.com/aviator-co/av/internal/sequencer/sequencerui"
+	"github.com/aviator-co/av/internal/utils/uiutils"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/spf13/cobra"
+)
+
+var reparentFlags struct {
+	Parent string
+}
+
+var reparentCmd = &cobra.Command{
+	Use:               "reparent",
+	Short:             "Change the parent of the current branch",
+	ValidArgsFunction: branchNameArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		repo, err := getRepo(ctx)
+		if err != nil {
+			return err
+		}
+
+		db, err := getDB(ctx, repo)
+		if err != nil {
+			return err
+		}
+
+		if reparentFlags.Parent != "" && len(args) > 0 && args[0] != "" {
+			if reparentFlags.Parent != args[0] {
+				return errors.New("conflicting parent branch names")
+			}
+		}
+		if len(args) > 0 && args[0] != "" {
+			reparentFlags.Parent = args[0]
+		}
+		if reparentFlags.Parent == "" {
+			return errors.New("missing parent branch name")
+		}
+		reparentFlags.Parent = stripRemoteRefPrefixes(repo, reparentFlags.Parent)
+		if reparentFlags.Parent == "HEAD" {
+			reparentFlags.Parent = repo.DefaultBranch()
+		}
+
+		return uiutils.RunBubbleTea(&reparentViewModel{repo: repo, db: db})
+	},
+}
+
+type reparentViewModel struct {
+	repo *git.Repo
+	db   meta.DB
+
+	state        *sequencerui.RestackState
+	restackModel tea.Model
+
+	quitWithConflict bool
+	err              error
+}
+
+func (vm *reparentViewModel) Init() tea.Cmd {
+	var err error
+	vm.state, err = vm.createState()
+	if err != nil {
+		return uiutils.ErrCmd(err)
+	}
+	vm.restackModel = sequencerui.NewRestackModel(vm.repo, vm.db, vm.state, sequencerui.RestackStateOptions{
+		OnConflict: func() tea.Cmd {
+			if err := vm.writeState(vm.state); err != nil {
+				return uiutils.ErrCmd(err)
+			}
+			vm.quitWithConflict = true
+			return tea.Quit
+		},
+		OnAbort: func() tea.Cmd {
+			if err := vm.writeState(nil); err != nil {
+				return uiutils.ErrCmd(err)
+			}
+			return tea.Quit
+		},
+		OnDone: func() tea.Cmd {
+			if err := vm.writeState(nil); err != nil {
+				return uiutils.ErrCmd(err)
+			}
+			return tea.Quit
+		},
+	})
+	return vm.restackModel.Init()
+}
+
+func (vm *reparentViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case *sequencerui.RestackProgress, spinner.TickMsg:
+		var cmd tea.Cmd
+		vm.restackModel, cmd = vm.restackModel.Update(msg)
+		return vm, cmd
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "ctrl+c":
+			return vm, tea.Quit
+		}
+	case error:
+		vm.err = msg
+		return vm, tea.Quit
+	}
+	return vm, nil
+}
+
+func (vm *reparentViewModel) View() tea.View {
+	var ss []string
+	ss = append(ss, "Reparenting onto "+reparentFlags.Parent+"...")
+	if vm.restackModel != nil {
+		ss = append(ss, vm.restackModel.View().Content)
+	}
+
+	var ret string
+	if len(ss) != 0 {
+		ret = lipgloss.NewStyle().MarginTop(1).MarginBottom(1).MarginLeft(2).Render(
+			lipgloss.JoinVertical(0, ss...),
+		)
+	}
+	if vm.err != nil {
+		if len(ret) != 0 {
+			ret += "\n"
+		}
+		ret += uiutils.RenderError(vm.err)
+	}
+	return tea.NewView(ret)
+}
+
+func (vm *reparentViewModel) writeState(state *sequencerui.RestackState) error {
+	if state == nil {
+		return vm.repo.WriteStateFile(git.StateFileKindRestack, nil)
+	}
+	return vm.repo.WriteStateFile(git.StateFileKindRestack, state)
+}
+
+func (vm *reparentViewModel) createState() (*sequencerui.RestackState, error) {
+	ctx := context.Background()
+	currentBranch, err := vm.repo.CurrentBranchName()
+	if err != nil {
+		return nil, err
+	}
+	if vm.repo.IsTrunkBranch(currentBranch) {
+		return nil, errors.New("current branch is a trunk branch")
+	}
+	if _, exist := vm.db.ReadTx().Branch(currentBranch); !exist {
+		return nil, errors.New("current branch is not adopted to av")
+	}
+
+	if !vm.repo.IsTrunkBranch(reparentFlags.Parent) {
+		if _, exist := vm.db.ReadTx().Branch(reparentFlags.Parent); !exist {
+			return nil, errors.New("parent branch is not adopted to av")
+		}
+	}
+	var state sequencerui.RestackState
+	state.InitialBranch = currentBranch
+	state.RelatedBranches = []string{currentBranch, reparentFlags.Parent}
+	ops, err := planner.PlanForReparent(
+		ctx,
+		vm.db.ReadTx(),
+		vm.repo,
+		plumbing.NewBranchReferenceName(currentBranch),
+		plumbing.NewBranchReferenceName(reparentFlags.Parent),
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(ops) == 0 {
+		return nil, nothingToRestackError
+	}
+	state.Seq = sequencer.NewSequencer(vm.repo.GetRemoteName(), vm.db, ops)
+	return &state, nil
+}
+
+func (vm *reparentViewModel) ExitError() error {
+	if errors.Is(vm.err, nothingToRestackError) {
+		return nil
+	}
+	if vm.err != nil {
+		return actions.ErrExitSilently{ExitCode: 1}
+	}
+	if vm.quitWithConflict {
+		return actions.ErrExitSilently{ExitCode: 1}
+	}
+	return nil
+}
+
+func init() {
+	reparentCmd.Flags().StringVar(
+		&reparentFlags.Parent, "parent", "",
+		"parent branch to rebase onto",
+	)
+
+	_ = reparentCmd.RegisterFlagCompletionFunc(
+		"parent",
+		func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			branches, _ := allBranches(cmd.Context())
+			return branches, cobra.ShellCompDirectiveNoFileComp
+		},
+	)
+}

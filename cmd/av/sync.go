@@ -1,0 +1,572 @@
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+
+	tea "charm.land/bubbletea/v2"
+	"emperror.dev/errors"
+	"github.com/aviator-co/av/internal/actions"
+	"github.com/aviator-co/av/internal/config"
+	"github.com/aviator-co/av/internal/gh"
+	"github.com/aviator-co/av/internal/gh/ghui"
+	"github.com/aviator-co/av/internal/git"
+	"github.com/aviator-co/av/internal/git/gitui"
+	"github.com/aviator-co/av/internal/meta"
+	"github.com/aviator-co/av/internal/sequencer"
+	"github.com/aviator-co/av/internal/sequencer/planner"
+	"github.com/aviator-co/av/internal/sequencer/sequencerui"
+	"github.com/aviator-co/av/internal/utils/colors"
+	"github.com/aviator-co/av/internal/utils/sliceutils"
+	"github.com/aviator-co/av/internal/utils/uiutils"
+	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/mattn/go-isatty"
+	"github.com/spf13/cobra"
+)
+
+var syncFlags struct {
+	All              bool
+	RebaseToTrunk    bool
+	Current          bool
+	Abort            bool
+	Continue         bool
+	Skip             bool
+	Push             string
+	Prune            string
+	FastForwardTrunk bool
+}
+
+var syncCmd = &cobra.Command{
+	Use:   "sync",
+	Short: "Synchronize stacked branches with GitHub",
+	Long: strings.TrimSpace(`
+Synchronize stacked branches to be up-to-date with their parent branches.
+
+By default, this command will sync all branches starting at the root of the
+stack and recursively rebasing each branch based on the latest commit from the
+parent branch.
+
+If the --all flag is given, this command will sync all branches in the repository.
+
+If the --current flag is given, this command will not recursively sync dependent
+branches of the current branch within the stack. This allows you to make changes
+to the current branch before syncing the rest of the stack.
+
+If the --rebase-to-trunk flag is given, this command will synchronize changes from the
+latest commit to the repository base branch (e.g., main or master) into the
+stack. This is useful for rebasing a whole stack on the latest changes from the
+base branch.
+
+Branches can be excluded from --all operations using av sync-exclude.
+Excluded branches and their descendants will be skipped when running av sync --all,
+but can still be synced explicitly.
+`),
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		ctx := cmd.Context()
+		if !sliceutils.Contains(
+			[]string{"ask", "yes", "no"},
+			strings.ToLower(syncFlags.Push),
+		) {
+			return errors.New("invalid value for --push; must be one of ask, yes, no")
+		}
+		if !sliceutils.Contains(
+			[]string{"ask", "yes", "no"},
+			strings.ToLower(syncFlags.Prune),
+		) {
+			return errors.New("invalid value for --prune; must be one of ask, yes, no")
+		}
+		if cmd.Flags().Changed("no-fetch") {
+			return actions.ErrExitSilently{ExitCode: 1}
+		}
+		if cmd.Flags().Changed("trunk") {
+			return actions.ErrExitSilently{ExitCode: 1}
+		}
+		if cmd.Flags().Changed("parent") {
+			return actions.ErrExitSilently{ExitCode: 1}
+		}
+		if !cmd.Flags().Changed("ff-trunk") {
+			syncFlags.FastForwardTrunk = config.Av.Sync.FastForwardTrunk
+		}
+		repo, err := getRepo(ctx)
+		if err != nil {
+			return err
+		}
+		db, err := getDB(ctx, repo)
+		if err != nil {
+			return err
+		}
+		client, err := getGitHubClient(ctx)
+		if err != nil {
+			return err
+		}
+
+		return uiutils.RunBubbleTea(&syncViewModel{
+			repo:   repo,
+			db:     db,
+			client: client,
+		})
+	},
+}
+
+type savedSyncState struct {
+	RestackState *sequencerui.RestackState
+	SyncState    *syncState
+}
+
+type syncState struct {
+	TargetBranches   []plumbing.ReferenceName
+	Prune            string
+	Push             string
+	FastForwardTrunk bool
+}
+
+type syncViewModel struct {
+	repo   *git.Repo
+	db     meta.DB
+	client *gh.Client
+
+	state        *syncState
+	restackState *sequencerui.RestackState
+
+	quitWithConflict bool
+
+	uiutils.BaseStackedView
+}
+
+func (vm *syncViewModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	return vm, vm.BaseStackedView.Update(msg)
+}
+
+func (vm *syncViewModel) Init() tea.Cmd {
+	return vm.initSync()
+}
+
+func (vm *syncViewModel) initSync() tea.Cmd {
+	state, err := vm.readState()
+	if err != nil {
+		return uiutils.ErrCmd(err)
+	}
+	if state != nil {
+		return vm.continueWithState(state)
+	}
+	if syncFlags.Abort || syncFlags.Continue || syncFlags.Skip {
+		return uiutils.ErrCmd(errors.New("no restack in progress"))
+	}
+
+	isTrunkBranch, err := vm.repo.IsCurrentBranchTrunk()
+	if err != nil {
+		return uiutils.ErrCmd(err)
+	}
+	if isTrunkBranch && !syncFlags.All {
+		return vm.initTrunkCheck()
+	}
+	return vm.initPreAvHook()
+}
+
+func (vm *syncViewModel) initTrunkCheck() tea.Cmd {
+	return vm.AddView(&uiutils.NewlineModel{Model: uiutils.NewPromptModel(
+		"You are on the trunk, do you want to sync all stacks?",
+		[]string{"Yes", "No"},
+		func(choice string) tea.Cmd {
+			if choice == "Yes" {
+				syncFlags.All = true
+			}
+			if choice == "No" {
+				return tea.Quit
+			}
+			return vm.initPreAvHook()
+		},
+	)})
+}
+
+func (vm *syncViewModel) initPreAvHook() tea.Cmd {
+	return vm.AddView(newPreAvSyncHookModel(vm.repo, vm.initGitFetch))
+}
+
+func (vm *syncViewModel) initGitFetch() tea.Cmd {
+	ctx := context.Background()
+	status, err := vm.repo.Status(ctx)
+	if err != nil {
+		return uiutils.ErrCmd(err)
+	}
+	currentBranch := status.CurrentBranch
+
+	var targetBranches []plumbing.ReferenceName
+	if syncFlags.All {
+		var err error
+		targetBranches, err = planner.GetTargetBranches(
+			ctx,
+			vm.db.ReadTx(),
+			vm.repo,
+			true,
+			planner.AllBranches,
+		)
+		if err != nil {
+			return uiutils.ErrCmd(err)
+		}
+	} else {
+		if _, exist := vm.db.ReadTx().Branch(currentBranch); !exist {
+			return uiutils.ErrCmd(errors.New("current branch is not adopted to av"))
+		}
+		var err error
+		if syncFlags.Current {
+			targetBranches, err = planner.GetTargetBranches(ctx, vm.db.ReadTx(), vm.repo, true, planner.CurrentAndParents)
+		} else {
+			targetBranches, err = planner.GetTargetBranches(ctx, vm.db.ReadTx(), vm.repo, true, planner.CurrentStack)
+		}
+		if err != nil {
+			return uiutils.ErrCmd(err)
+		}
+	}
+
+	var currentBranchRef plumbing.ReferenceName
+	if currentBranch != "" {
+		currentBranchRef = plumbing.NewBranchReferenceName(currentBranch)
+	}
+
+	return vm.AddView(ghui.NewGitHubFetchModel(
+		vm.repo,
+		vm.db,
+		vm.client,
+		currentBranchRef,
+		targetBranches,
+		vm.initSequencerState,
+	))
+}
+
+func (vm *syncViewModel) initSequencerState() tea.Cmd {
+	state, err := vm.createState()
+	if err != nil {
+		return uiutils.ErrCmd(err)
+	}
+	if state == nil {
+		return uiutils.ErrCmd(nothingToRestackError)
+	}
+	return vm.continueWithState(state)
+}
+
+func (vm *syncViewModel) continueWithState(state *savedSyncState) tea.Cmd {
+	vm.state = state.SyncState
+	vm.restackState = state.RestackState
+	return vm.AddView(sequencerui.NewRestackModel(vm.repo, vm.db, state.RestackState, sequencerui.RestackStateOptions{
+		Command:  "av sync",
+		Abort:    syncFlags.Abort,
+		Continue: syncFlags.Continue,
+		Skip:     syncFlags.Skip,
+		OnConflict: func() tea.Cmd {
+			if err := vm.writeState(vm.restackState); err != nil {
+				return uiutils.ErrCmd(err)
+			}
+			vm.quitWithConflict = true
+			return tea.Quit
+		},
+		OnAbort: func() tea.Cmd {
+			if err := vm.writeState(nil); err != nil {
+				return uiutils.ErrCmd(err)
+			}
+			return tea.Quit
+		},
+		OnDone: func() tea.Cmd {
+			if err := vm.writeState(nil); err != nil {
+				return uiutils.ErrCmd(err)
+			}
+			return vm.initPushBranches()
+		},
+	}))
+}
+
+func (vm *syncViewModel) initPushBranches() tea.Cmd {
+	return vm.AddView(ghui.NewGitHubPushModel(
+		vm.repo,
+		vm.db,
+		vm.client,
+		vm.state.Push,
+		vm.state.TargetBranches,
+		vm.initPruneBranches,
+	))
+}
+
+func (vm *syncViewModel) initPruneBranches() tea.Cmd {
+	return vm.AddView(gitui.NewPruneBranchModel(
+		vm.repo,
+		vm.db,
+		vm.state.Prune,
+		vm.state.TargetBranches,
+		vm.restackState.InitialBranch,
+		vm.initFastForwardTrunk,
+	))
+}
+
+func (vm *syncViewModel) initFastForwardTrunk() tea.Cmd {
+	if !vm.state.FastForwardTrunk {
+		return tea.Quit
+	}
+	return vm.AddView(gitui.NewFastForwardTrunkModel(
+		vm.repo,
+		func() tea.Cmd {
+			return tea.Quit
+		},
+	))
+}
+
+func (vm *syncViewModel) readState() (*savedSyncState, error) {
+	var state savedSyncState
+	if err := vm.repo.ReadStateFile(git.StateFileKindSyncV2, &state); err != nil &&
+		os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	if !vm.repo.IsRebaseInProgress() {
+		if err := vm.repo.WriteStateFile(git.StateFileKindSyncV2, nil); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	return &state, nil
+}
+
+func (vm *syncViewModel) writeState(seqModel *sequencerui.RestackState) error {
+	if seqModel == nil {
+		return vm.repo.WriteStateFile(git.StateFileKindSyncV2, nil)
+	}
+	var state savedSyncState
+	state.RestackState = seqModel
+	state.SyncState = vm.state
+	return vm.repo.WriteStateFile(git.StateFileKindSyncV2, &state)
+}
+
+func (vm *syncViewModel) createState() (*savedSyncState, error) {
+	ctx := context.Background()
+	state := savedSyncState{
+		RestackState: &sequencerui.RestackState{},
+		SyncState: &syncState{
+			Push:             syncFlags.Push,
+			Prune:            syncFlags.Prune,
+			FastForwardTrunk: syncFlags.FastForwardTrunk,
+		},
+	}
+	status, err := vm.repo.Status(ctx)
+	if err != nil {
+		return nil, err
+	}
+	currentBranch := status.CurrentBranch
+	state.RestackState.InitialBranch = currentBranch
+
+	var targetBranches []plumbing.ReferenceName
+	if syncFlags.All {
+		var err error
+		targetBranches, err = planner.GetTargetBranches(
+			ctx,
+			vm.db.ReadTx(),
+			vm.repo,
+			true,
+			planner.AllBranches,
+		)
+		if err != nil {
+			return nil, err
+		}
+		state.RestackState.RestackingAll = true
+	} else {
+		if _, exist := vm.db.ReadTx().Branch(currentBranch); !exist {
+			return nil, errors.New("current branch is not adopted to av")
+		}
+		var err error
+		if syncFlags.Current {
+			targetBranches, err = planner.GetTargetBranches(ctx, vm.db.ReadTx(), vm.repo, true, planner.CurrentAndParents)
+		} else {
+			targetBranches, err = planner.GetTargetBranches(ctx, vm.db.ReadTx(), vm.repo, true, planner.CurrentStack)
+		}
+		if err != nil {
+			return nil, err
+		}
+		state.RestackState.RelatedBranches = append(state.RestackState.RelatedBranches, currentBranch)
+	}
+	state.SyncState.TargetBranches = targetBranches
+
+	var currentBranchRef plumbing.ReferenceName
+	if currentBranch != "" {
+		currentBranchRef = plumbing.NewBranchReferenceName(currentBranch)
+	}
+	ops, err := planner.PlanForSync(
+		ctx,
+		vm.db.ReadTx(),
+		vm.repo,
+		currentBranchRef,
+		syncFlags.All,
+		syncFlags.Current,
+		syncFlags.RebaseToTrunk,
+	)
+	if err != nil {
+		return nil, err
+	}
+	state.RestackState.Seq = sequencer.NewSequencer(vm.repo.GetRemoteName(), vm.db, ops)
+	return &state, nil
+}
+
+func (vm *syncViewModel) ExitError() error {
+	if errors.Is(vm.Err, nothingToRestackError) {
+		return nil
+	}
+	if vm.Err != nil {
+		return actions.ErrExitSilently{ExitCode: 1}
+	}
+	if vm.quitWithConflict {
+		return actions.ErrExitSilently{ExitCode: 1}
+	}
+	return nil
+}
+
+type preAvSyncHookModel struct {
+	repo   *git.Repo
+	onDone func() tea.Cmd
+
+	hasHook  bool
+	complete bool
+}
+
+type preAvSyncHookProgress struct{}
+
+func newPreAvSyncHookModel(repo *git.Repo, onDone func() tea.Cmd) *preAvSyncHookModel {
+	return &preAvSyncHookModel{
+		repo:   repo,
+		onDone: onDone,
+	}
+}
+
+func (m *preAvSyncHookModel) Init() tea.Cmd {
+	_, err := os.Lstat(filepath.Join(m.repo.GitDir(), "hooks", "pre-av-sync"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return func() tea.Msg { return preAvSyncHookProgress{} }
+		}
+		return uiutils.ErrCmd(err)
+	}
+	m.hasHook = true
+	ctx := context.Background()
+	cmd := m.repo.Cmd(ctx, m.repo.HookRunArgs(ctx, "pre-av-sync"), nil)
+	if !isatty.IsTerminal(os.Stdin.Fd()) || !isatty.IsTerminal(os.Stdout.Fd()) {
+		// When not in a terminal, run the hook as a regular subprocess instead of
+		// tea.ExecProcess. ExecProcess tries to suspend and re-initialize bubbletea's
+		// terminal reader after the process exits, which causes a nil pointer
+		// dereference when there is no TTY (e.g., running from an IDE or script).
+		cmd.Stdin = os.Stdin
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		return func() tea.Msg {
+			if err := cmd.Run(); err != nil {
+				return errors.Errorf("pre-av-sync hook failed: %v", err)
+			}
+			m.complete = true
+			return preAvSyncHookProgress{}
+		}
+	}
+	// Use tea.ExecProcess so that the hook can take over the terminal, allowing user to create
+	// an interactive hook.
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+		if err != nil {
+			return errors.Errorf("pre-av-sync hook failed: %v", err)
+		}
+		m.complete = true
+		return preAvSyncHookProgress{}
+	})
+}
+
+func (m *preAvSyncHookModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg.(type) {
+	case preAvSyncHookProgress:
+		return m, m.onDone()
+	}
+	return m, nil
+}
+
+func (m *preAvSyncHookModel) View() tea.View {
+	if !m.hasHook {
+		// Do not even render anything if there is no hook for simplicity. We show the
+		// status only when the hook exists.
+		return tea.NewView("")
+	}
+	// NOTE: It is tempting to add a spinner here, but because the hook runs with a terminal
+	// control, the spinner actually doesn't render / updated until the hook is done. Because
+	// the terminal control is regained after the hook is done, and bubbletea will not erase the
+	// content rendered while it didn't have a control (which is a sane behavior as it cannot
+	// tell what was rendered while that) that previous spinner render will never be updated.
+	// Due to this, we will have a better visual experience by not showing a spinner at all
+	// here.
+	if m.complete {
+		return tea.NewView(colors.SuccessStyle.Render("✓ pre-av-sync hook completed"))
+	}
+	// We don't have to render anything here because the pre-av-sync failure message will be
+	// rendered through error. The stdout / stderr of the hook will be shown directly in the
+	// terminal as bubbletea won't erase the terminal content prior to the terminal control
+	// take over.
+	return tea.NewView("")
+}
+
+func init() {
+	syncCmd.Flags().BoolVar(
+		&syncFlags.All, "all", false,
+		"synchronize all branches",
+	)
+	syncCmd.Flags().BoolVar(
+		&syncFlags.Current, "current", false,
+		"only sync changes to the current branch\n(don't recurse into descendant branches)",
+	)
+	syncCmd.Flags().StringVar(
+		&syncFlags.Push, "push", "ask",
+		"push the rebased branches to the remote repository\n(ask|yes|no)",
+	)
+	syncCmd.Flags().StringVar(
+		&syncFlags.Prune, "prune", "ask",
+		"delete branches that have been merged into the parent branch\n(ask|yes|no)",
+	)
+	syncCmd.Flags().Lookup("prune").NoOptDefVal = "ask"
+	syncCmd.Flags().BoolVar(
+		&syncFlags.RebaseToTrunk, "rebase-to-trunk", false,
+		"rebase the branches to the latest trunk always",
+	)
+	syncCmd.Flags().BoolVar(
+		&syncFlags.FastForwardTrunk, "ff-trunk", false,
+		"fast-forward the local trunk branch to match the remote",
+	)
+
+	syncCmd.Flags().BoolVar(
+		&syncFlags.Continue, "continue", false,
+		"continue an in-progress sync",
+	)
+	syncCmd.Flags().BoolVar(
+		&syncFlags.Abort, "abort", false,
+		"abort an in-progress sync",
+	)
+	syncCmd.Flags().BoolVar(
+		&syncFlags.Skip, "skip", false,
+		"skip the current commit and continue an in-progress sync",
+	)
+	syncCmd.MarkFlagsMutuallyExclusive("current", "all")
+	syncCmd.MarkFlagsMutuallyExclusive("continue", "abort", "skip")
+
+	// Deprecated flags
+	syncCmd.Flags().Bool(
+		"no-fetch", false,
+		"(deprecated; use av restack for offline restacking) do not fetch the latest status from GitHub",
+	)
+	_ = syncCmd.Flags().
+		MarkDeprecated("no-fetch", "please use av restack for offline restacking")
+
+	syncCmd.Flags().Bool(
+		"trunk", false,
+		"(deprecated; use --rebase-to-trunk to rebase all branches to trunk) rebase the stack on the trunk branch",
+	)
+	_ = syncCmd.Flags().
+		MarkDeprecated("trunk", "please use --rebase-to-trunk to rebase all branches to trunk")
+
+	syncCmd.Flags().String(
+		"parent", "",
+		"(deprecated; use 'av adopt' or 'av reparent') parent branch to rebase onto",
+	)
+	_ = syncCmd.Flags().
+		MarkDeprecated("parent", "please use 'av adopt' or 'av reparent'")
+}

@@ -1,0 +1,434 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"emperror.dev/errors"
+	"github.com/aviator-co/av/internal/actions"
+	"github.com/aviator-co/av/internal/avgql"
+	"github.com/aviator-co/av/internal/config"
+	"github.com/aviator-co/av/internal/gh"
+	"github.com/aviator-co/av/internal/git"
+	"github.com/aviator-co/av/internal/meta"
+	"github.com/aviator-co/av/internal/utils/cleanup"
+	"github.com/aviator-co/av/internal/utils/colors"
+	"github.com/shurcooL/githubv4"
+	"github.com/shurcooL/graphql"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+)
+
+var prFlags struct {
+	Draft     bool
+	Force     bool
+	NoPush    bool
+	Title     string
+	Body      string
+	Edit      bool
+	Reviewers []string
+	Queue     bool
+	All       bool
+	Current   bool
+}
+
+var prCmd = &cobra.Command{
+	Use:   "pr",
+	Short: "Create or update a pull request for the current branch",
+	Long: strings.TrimSpace(`
+Create or update a pull request for the current branch.
+
+When creating a new pull request, an editor opens for the title and body unless
+they are provided via flags. If the branch has a parent, the parent must have a
+pull request first.
+
+When a pull request already exists, the command just pushes the branch to the
+remote without opening an editor. Use --edit to modify the existing description.
+
+Examples:
+  Push and sync an existing PR (no editor, no extra flags needed):
+    $ av pr
+
+  Create a PR with an empty body:
+    $ av pr --title "My PR"
+
+  Create a pull request, specifying the body of the PR from standard input:
+    $ av pr --title "Implement fancy feature" --body - <<EOF
+    > Implement my very fancy feature.
+    > Can you please review it?
+    > EOF
+
+  Create a pull request, assigning reviewers:
+    $ av pr --reviewers "example,@example-org/example-team"
+
+  Create pull requests for every branch in the stack:
+	$ av pr --all
+`),
+	Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, _ []string) (reterr error) {
+		ctx := cmd.Context()
+		if prFlags.Queue {
+			if prFlags.Draft ||
+				prFlags.Force ||
+				prFlags.NoPush ||
+				prFlags.Title != "" ||
+				prFlags.Body != "" ||
+				prFlags.Edit ||
+				prFlags.Reviewers != nil {
+
+				return errors.New("cannot use other flags with --queue")
+			}
+			return queue(ctx)
+		}
+
+		if prFlags.All {
+			if prFlags.Force ||
+				prFlags.NoPush ||
+				prFlags.Title != "" ||
+				prFlags.Body != "" ||
+				prFlags.Edit ||
+				prFlags.Reviewers != nil ||
+				prFlags.Queue {
+
+				return errors.New("can only use --current and --draft with --all")
+			}
+
+			return submitAll(ctx, prFlags.Current, prFlags.Draft)
+		}
+
+		repo, err := getRepo(ctx)
+		if err != nil {
+			return err
+		}
+		branchName, err := repo.CurrentBranchName()
+		if err != nil {
+			return errors.WrapIf(err, "failed to determine current branch")
+		}
+
+		if err := runPRHook(ctx, repo, "single"); err != nil {
+			return err
+		}
+
+		client, err := getGitHubClient(ctx)
+		if err != nil {
+			return err
+		}
+
+		db, err := getDB(ctx, repo)
+		if err != nil {
+			return err
+		}
+		tx := db.WriteTx()
+		defer tx.Abort()
+
+		// Special case: read body from stdin
+		if prFlags.Body == "-" {
+			bodyBytes, err := io.ReadAll(os.Stdin)
+			if err != nil {
+				return errors.Wrap(err, "failed to read body from stdin")
+			}
+			prFlags.Body = string(bodyBytes)
+		}
+		body := prFlags.Body
+
+		draft := config.Av.PullRequest.Draft
+		if cmd.Flags().Changed("draft") {
+			draft = prFlags.Draft
+		}
+
+		res, err := actions.CreatePullRequest(
+			ctx, repo, client, tx,
+			actions.CreatePullRequestOpts{
+				BranchName: branchName,
+				Title:      prFlags.Title,
+				Body:       body,
+				NoPush:     prFlags.NoPush,
+				Force:      prFlags.Force,
+				Draft:      draft,
+				Edit:       prFlags.Edit,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+
+		// Do this after creating the PR and committing the transaction so that
+		// our local database is up-to-date even if this fails.
+		if len(prFlags.Reviewers) > 0 {
+			if err := actions.AddPullRequestReviewers(ctx, client, res.Pull.ID, prFlags.Reviewers); err != nil {
+				return err
+			}
+		}
+
+		if config.Av.PullRequest.WriteStack {
+			stackBranches, err := meta.StackBranches(tx, branchName)
+			if err != nil {
+				return err
+			}
+
+			return actions.UpdatePullRequestsWithStack(ctx, client, tx, stackBranches)
+		}
+
+		return nil
+	},
+}
+
+func submitAll(ctx context.Context, current bool, draft bool) error {
+	repo, err := getRepo(ctx)
+	if err != nil {
+		return err
+	}
+
+	db, err := getDB(ctx, repo)
+	if err != nil {
+		return err
+	}
+	tx := db.WriteTx()
+	cu := cleanup.New(func() { tx.Abort() })
+	defer cu.Cleanup()
+
+	currentBranch, err := repo.CurrentBranchName()
+	if err != nil {
+		return err
+	}
+
+	currentStackBranches, err := meta.StackBranches(tx, currentBranch)
+	if err != nil {
+		return err
+	}
+
+	var branchesToSubmit []string
+	if current {
+		previousBranches, err := meta.PreviousBranches(tx, currentBranch)
+		if err != nil {
+			return err
+		}
+		branchesToSubmit = append(branchesToSubmit, previousBranches...)
+		branchesToSubmit = append(branchesToSubmit, currentBranch)
+	} else {
+		branchesToSubmit = currentStackBranches
+	}
+
+	if !current {
+		subsequentBranches := meta.SubsequentBranches(tx, currentBranch)
+		branchesToSubmit = append(branchesToSubmit, subsequentBranches...)
+	}
+
+	if err := runPRHook(ctx, repo, "all"); err != nil {
+		return err
+	}
+
+	// ensure pull requests for each branch in the stack
+	createdPullRequestPermalinks := []string{}
+	client, err := getGitHubClient(ctx)
+	if err != nil {
+		return err
+	}
+	for _, branchName := range branchesToSubmit {
+		// TODO: should probably commit database after every call to this
+		// since we're just syncing state from GitHub
+
+		draft := config.Av.PullRequest.Draft || draft
+
+		result, err := actions.CreatePullRequest(
+			ctx, repo, client, tx,
+			actions.CreatePullRequestOpts{
+				BranchName:    branchName,
+				Draft:         draft,
+				NoOpenBrowser: true,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if result.Created {
+			createdPullRequestPermalinks = append(
+				createdPullRequestPermalinks,
+				result.Branch.PullRequest.Permalink,
+			)
+		}
+		// make sure the base branch of the PR is up to date if it already exists
+		if !result.Created && result.Pull.BaseRefName != result.Branch.Parent.Name {
+			if _, err := client.UpdatePullRequest(
+				ctx, githubv4.UpdatePullRequestInput{
+					PullRequestID: githubv4.ID(result.Branch.PullRequest.ID),
+					BaseRefName:   gh.Ptr(githubv4.String(result.Branch.Parent.Name)),
+				},
+			); err != nil {
+				return errors.Wrap(err, "failed to update PR base branch")
+			}
+		}
+	}
+
+	cu.Cancel()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	if config.Av.PullRequest.WriteStack {
+		if err = actions.UpdatePullRequestsWithStack(ctx, client, tx, currentStackBranches); err != nil {
+			return err
+		}
+	}
+
+	if config.Av.PullRequest.OpenBrowser {
+		for _, createdPullRequestPermalink := range createdPullRequestPermalinks {
+			actions.OpenPullRequestInBrowser(ctx, createdPullRequestPermalink)
+		}
+	}
+
+	return nil
+}
+
+func queue(ctx context.Context) error {
+	repo, err := getRepo(ctx)
+	if err != nil {
+		return err
+	}
+
+	db, err := getDB(ctx, repo)
+	if err != nil {
+		return err
+	}
+
+	tx := db.ReadTx()
+	currentBranchName, err := repo.CurrentBranchName()
+	if err != nil {
+		return err
+	}
+
+	branch, _ := tx.Branch(currentBranchName)
+	if branch.PullRequest == nil {
+		return errors.New(
+			"this branch has no associated pull request (run 'av pr' to create one)",
+		)
+	}
+
+	if err := runPRHook(ctx, repo, "queue"); err != nil {
+		return err
+	}
+
+	prNumber := branch.PullRequest.Number
+	repository := tx.Repository()
+
+	variables := map[string]any{
+		"repoOwner": graphql.String(repository.Owner),
+		"repoName":  graphql.String(repository.Name),
+		// prNumber is int64 graphql expects in32, we should not have more than 2^31-1 PRs
+		"prNumber": graphql.Int(prNumber), //nolint:gosec
+	}
+
+	// I have a feeling this would be better written inside of av/internals
+	client, err := avgql.NewClient(ctx)
+	if err != nil {
+		return err
+	}
+
+	var mutation struct {
+		QueuePullRequest struct {
+			QueuePullRequestPayload struct {
+				PullRequest struct {
+					// We don't currently use anything here, but we need to select
+					// at least one field to make the GraphQL query valid.
+					Status graphql.String
+				}
+			} `graphql:"... on QueuePullRequestPayload"`
+		} `graphql:"queuePullRequest(input: {repoOwner: $repoOwner, repoName:$repoName, number:$prNumber})"`
+	}
+
+	err = client.Mutate(ctx, &mutation, variables)
+	if err != nil {
+		logrus.WithError(err).Debug("failed to queue pull request")
+		return fmt.Errorf("failed to queue pull request: %s", err)
+	}
+	fmt.Fprint(
+		os.Stderr,
+		"Queued pull request ", colors.UserInput(branch.PullRequest.Permalink), ".\n",
+	)
+
+	return nil
+}
+
+func runPRHook(ctx context.Context, repo *git.Repo, hookType string) error {
+	output, err := repo.Run(ctx, &git.RunOpts{
+		Args:        repo.HookRunArgs(ctx, "pre-av-pr"),
+		Env:         []string{"AV_PR_HOOK_TYPE=" + hookType},
+		Interactive: true,
+		ExitError:   true,
+	})
+	var messages []string
+	if output != nil {
+		if len(output.Stdout) != 0 {
+			messages = append(messages, string(output.Stdout))
+		}
+		if len(output.Stderr) != 0 {
+			messages = append(messages, string(output.Stderr))
+		}
+	}
+	if len(messages) != 0 {
+		fmt.Fprint(os.Stderr, strings.Join(messages, "\n"))
+	}
+	if err != nil {
+		return errors.Errorf("pre-av-pr hook failed: %v", err)
+	}
+	return nil
+}
+
+func init() {
+	prCmd.Flags().BoolVar(
+		&prFlags.Draft, "draft", false,
+		"create the pull request in draft mode",
+	)
+	prCmd.Flags().BoolVar(
+		&prFlags.Force, "force", false,
+		"force creation of a pull request even if there is already a pull request associated with this branch",
+	)
+	prCmd.Flags().BoolVar(
+		&prFlags.NoPush, "no-push", false,
+		"don't push the branch to the remote repository before creating the pull request",
+	)
+	prCmd.Flags().StringVarP(
+		&prFlags.Title, "title", "t", "",
+		"title of the pull request to create",
+	)
+	prCmd.Flags().StringVarP(
+		&prFlags.Body, "body", "b", "",
+		"body of the pull request to create (a value of - will read from stdin)",
+	)
+	prCmd.Flags().BoolVar(
+		&prFlags.Edit, "edit", false,
+		"edit the pull request title and description before submitting even if the pull request already exists",
+	)
+	prCmd.Flags().StringSliceVar(
+		&prFlags.Reviewers, "reviewers", nil,
+		"add reviewers to the pull request (can be usernames or team names)",
+	)
+	prCmd.Flags().BoolVar(
+		&prFlags.Queue, "queue", false,
+		"queue an existing pull request for the current branch",
+	)
+	prCmd.Flags().BoolVar(
+		&prFlags.All, "all", false,
+		"create pull requests for every branch in stack (up to current branch with --current)",
+	)
+	prCmd.Flags().BoolVar(
+		&prFlags.Current, "current", false,
+		"create pull requests up to the current branch",
+	)
+	_ = prCmd.Flags().MarkHidden("current")
+
+	deprecatedCreateCmd := deprecateCommand(*prCmd, "av pr", "create")
+	deprecatedCreateCmd.Hidden = true
+
+	prCmd.AddCommand(
+		deprecatedCreateCmd,
+		prQueueCmd,
+		prStatusCmd,
+	)
+}

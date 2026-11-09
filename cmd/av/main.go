@@ -1,0 +1,227 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"emperror.dev/errors"
+	"github.com/aviator-co/av/internal/actions"
+	"github.com/aviator-co/av/internal/config"
+	"github.com/aviator-co/av/internal/gh"
+	"github.com/aviator-co/av/internal/utils/colors"
+	"github.com/aviator-co/av/internal/utils/uiutils"
+	"github.com/fatih/color"
+	"github.com/kr/text"
+	"github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
+	"golang.org/x/mod/semver"
+)
+
+var rootFlags struct {
+	Debug     bool
+	Directory string
+}
+
+var rootCmd = &cobra.Command{
+	Use:     "av",
+	Version: config.Version,
+
+	// Don't automatically print errors or usage information (we handle that ourselves).
+	// Cobra still prints usage if you return cmd.Usage() from RunE.
+	SilenceErrors: true,
+	SilenceUsage:  true,
+
+	// Don't show "completion" command in help menu
+	CompletionOptions: cobra.CompletionOptions{
+		HiddenDefaultCmd: true,
+	},
+
+	// Run setup before invoking any child commands.
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+		if rootFlags.Debug {
+			logrus.SetLevel(logrus.DebugLevel)
+			logrus.WithField("av_version", config.Version).Debug("enabled debug logging")
+		}
+
+		repoConfigDir := ""
+		repo, err := getRepo(ctx)
+		// If we weren't able to load the Git repo, that probably just means the
+		// command isn't being run from inside a repo. That's fine, we just
+		// don't need to bother reading repo-local config.
+		if err != nil {
+			logrus.WithError(err).Debug("unable to load Git repo (probably not inside a repo)")
+		} else {
+			gitCommonDir, err := repo.Git(ctx, "rev-parse", "--git-common-dir")
+			if err != nil {
+				logrus.WithError(err).Warning("failed to determine $GIT_COMMON_DIR")
+			} else {
+				gitCommonDir, err = filepath.Abs(gitCommonDir)
+				if err != nil {
+					logrus.WithError(err).Warning("failed to determine $GIT_COMMON_DIR")
+				} else {
+					logrus.WithField("git_common_dir", gitCommonDir).Debug("loaded Git repo")
+					repoConfigDir = filepath.Join(gitCommonDir, "av")
+				}
+			}
+		}
+
+		// Note: this only returns an error if config exists and it can't be
+		// read/parsed. It doesn't return an error if no config file exists.
+		if err := config.Load(repoConfigDir); err != nil {
+			return errors.Wrap(err, "failed to load configuration")
+		}
+		if err := config.LoadUserState(); err != nil {
+			return errors.Wrap(err, "failed to load the user state")
+		}
+		return nil
+	},
+}
+
+func init() {
+	rootCmd.SetVersionTemplate("{{.Version}}\n")
+	rootCmd.PersistentFlags().BoolVar(
+		&rootFlags.Debug, "debug", false,
+		"enable verbose debug logging",
+	)
+	rootCmd.PersistentFlags().StringVarP(
+		&rootFlags.Directory, "repo", "C", "",
+		"directory to use for git repository",
+	)
+	rootCmd.AddCommand(
+		adoptCmd,
+		authCmd,
+		branchCmd,
+		branchMetaCmd,
+		commitCmd,
+		validateDBCmd,
+		diffCmd,
+		fetchCmd,
+		initCmd,
+		nextCmd,
+		orphanCmd,
+		prCmd,
+		prevCmd,
+		reorderCmd,
+		reparentCmd,
+		splitCommitCmd,
+		stackCmd,
+		switchCmd,
+		syncCmd,
+		syncExcludeCmd,
+		restackCmd,
+		tidyCmd,
+		treeCmd,
+		versionCmd,
+		squashCmd,
+	)
+}
+
+// main keeps os.Exit in a thin wrapper so that run's defers (e.g. closing the
+// git repo) always fire before the process exits.
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	// Note: this doesn't include whatever time is spent in initializing the
+	// runtime and various packages (e.g., package init functions).
+	startTime := time.Now()
+	colors.SetupBackgroundColorTypeFromEnv()
+	defer func() { _ = cachedRepo.Close() }()
+	err := rootCmd.Execute()
+	logrus.WithField("duration", time.Since(startTime)).Debug("command exited")
+	checkCliVersion()
+	var exitSilently actions.ErrExitSilently
+	if errors.As(err, &exitSilently) {
+		return exitSilently.ExitCode
+	}
+	if err != nil {
+		// In debug mode, show more detailed information about the error
+		// (including the stack trace if using pkg/errors).
+		if rootFlags.Debug {
+			stackTrace := fmt.Sprintf("%+v", err)
+			fmt.Fprintf(os.Stderr, "error: %s\n%s\n", err, text.Indent(stackTrace, "\t"))
+		} else {
+			fmt.Fprint(os.Stderr, uiutils.RenderError(err))
+		}
+
+		return 1
+	}
+	return 0
+}
+
+func checkCliVersion() {
+	if config.Version == config.VersionDev {
+		logrus.Debug("Skipping CLI version check (development version)")
+		return
+	}
+	if slices.Contains(os.Args, "completion") {
+		// Skip the update check as it can slow down the shell initialization on a
+		// slow network connection. This can have a false positive, but this is
+		// anyway an optional check.
+		logrus.Debug("Skipping CLI version check (shell completion)")
+		return
+	}
+	latest, err := config.FetchLatestVersion()
+	if err != nil {
+		logrus.WithError(err).Debug("failed to determine latest released version of av")
+		return
+	}
+	logrus.WithField("latest", latest).Debug("fetched latest released version")
+	currentBase := strings.TrimSuffix(config.Version, semver.Prerelease(config.Version))
+	latestBase := strings.TrimSuffix(latest, semver.Prerelease(latest))
+	if semver.Compare(currentBase, latestBase) < 0 {
+		c := color.New(color.Faint, color.Bold)
+		fmt.Fprint(
+			os.Stderr,
+			c.Sprint(">> A new version of av is available: "),
+			color.RedString(config.Version),
+			c.Sprint(" => "),
+			color.GreenString(latest),
+			"\n",
+			c.Sprint(">> https://docs.aviator.co/reference/aviator-cli/installation#upgrade\n"),
+		)
+	}
+}
+
+var (
+	once             sync.Once
+	lazyGithubClient *gh.Client
+)
+
+func discoverGitHubAPIToken(ctx context.Context) string {
+	if config.Av.GitHub.Token != "" {
+		return config.Av.GitHub.Token
+	}
+	if ghCli, err := exec.LookPath("gh"); err == nil {
+		var stdout bytes.Buffer
+		cmd := exec.CommandContext(ctx, ghCli, "auth", "token")
+		cmd.Stdout = &stdout
+		cmd.Stderr = nil
+		if err := cmd.Run(); err == nil {
+			return strings.TrimSpace(stdout.String())
+		}
+	}
+	return ""
+}
+
+func getGitHubClient(ctx context.Context) (*gh.Client, error) {
+	token := discoverGitHubAPIToken(ctx)
+	if token == "" {
+		return nil, uiutils.ErrNoGitHubToken
+	}
+	var err error
+	once.Do(func() {
+		lazyGithubClient, err = gh.NewClient(ctx, token)
+	})
+	return lazyGithubClient, err
+}
